@@ -8,6 +8,6 @@ SimpleNet takes a 10-feature input, passes it through a hidden layer with 16 neu
 *Note: A seed is used to reproduce the same results and verify the model works correctly on the web.*
 
 ## Steps
-1. Run `export_model.py` to get the network and weights
+1. Run `export_model.py` to get the network and weights u can also use `export_with_torchscript.py` as it works for more complex models
 2. Run `index.html` with a server (use Chrome and enable WebGPU)
 3. Results should match the Python code (`simple_nn` file) - change inputs on both to verify 
