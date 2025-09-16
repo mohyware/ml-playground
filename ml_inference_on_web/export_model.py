@@ -34,7 +34,7 @@ for name, module in model.named_children():
     layers.append(layer_info)
 
 # Save network spec and weight mapping
-with open(f"{OUT_DIR}/network.json", "w") as f:
+with open(f"{OUT_DIR}/graph.json", "w") as f:
     json.dump(layers, f, indent=2)
 with open(f"{OUT_DIR}/weights.json", "w") as f:
     json.dump(weights_dict, f, indent=2)

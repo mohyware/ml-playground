@@ -6,20 +6,20 @@
     <title>Dynamic Network Runner</title>
     <script type="module">
 
-        // ---------- Utility: load .npy ----------
+        //  Utility: load .npy 
         async function loadNpy(url) {
             const res = await fetch(url);
             const ab = await res.arrayBuffer();
             return new Float32Array(ab.slice(128)); // skip header (~128 bytes typical)
         }
 
-        // ---------- Load network JSON ----------
+        //  Load network JSON 
         async function loadNetwork() {
-            const network = await fetch('web_model/network.json').then(r => r.json());
+            const network = await fetch('web_model/graph.json').then(r => r.json());
             return network;
         }
 
-        // ---------- Initialize WebGPU ----------
+        //  Initialize WebGPU 
         async function initWebGPU() {
             if (!navigator.gpu) throw new Error("WebGPU not supported");
             const adapter = await navigator.gpu.requestAdapter();
@@ -27,7 +27,7 @@
             return device;
         }
 
-        // ---------- Create GPU buffer ----------
+        //  Create GPU buffer 
         function createBuffer(device, array, usage) {
             const buffer = device.createBuffer({
                 size: array.byteLength,
@@ -39,7 +39,7 @@
             return buffer;
         }
 
-        // ---------- MatMul + Bias pipeline ----------
+        //  MatMul + Bias pipeline 
         async function createMatMulPipeline(device, M, N, K) {
             const code = `
             struct Buf { data: array<f32>, };
@@ -68,7 +68,7 @@
         //                     sum += A.data[m * ${K}u + k] * W.data[n * ${K}u + k];
         //                     sum += A[m * ${K}u + k] * W[k * ${N}u + n];
 
-        // ---------- Execute MatMul + Bias ----------
+        //  Execute MatMul + Bias 
         async function matMul(device, pipeline, A_buf, W_buf, B_buf, M, N) {
             const outSize = M * N * 4;
             const Out_buf = device.createBuffer({ size: outSize, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
@@ -106,7 +106,7 @@
             return array;
         }
 
-        // ---------- ReLU ----------
+        //  ReLU 
         async function relu(device, X_buf, length) {
             const code = `
             @group(0) @binding(0) var<storage, read_write> X: array<f32>;
@@ -133,7 +133,7 @@
             device.queue.submit([encoder.finish()]);
         }
 
-        // ---------- Run dynamic network ----------
+        //  Run dynamic network 
         async function runNetwork(inputArray) {
             const device = await initWebGPU();
             const network = await loadNetwork();
