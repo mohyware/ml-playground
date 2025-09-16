@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <meta charset="UTF-8">
+    <title>Dynamic Network Runner</title>
+    <script type="module">
+
+        // ---------- Utility: load .npy ----------
+        async function loadNpy(url) {
+            const res = await fetch(url);
+            const ab = await res.arrayBuffer();
+            return new Float32Array(ab.slice(128)); // skip header (~128 bytes typical)
+        }
+
+        // ---------- Load network JSON ----------
+        async function loadNetwork() {
+            const network = await fetch('web_model/network.json').then(r => r.json());
+            return network;
+        }
+
+        // ---------- Initialize WebGPU ----------
+        async function initWebGPU() {
+            if (!navigator.gpu) throw new Error("WebGPU not supported");
+            const adapter = await navigator.gpu.requestAdapter();
+            const device = await adapter.requestDevice();
+            return device;
+        }
+
+        // ---------- Create GPU buffer ----------
+        function createBuffer(device, array, usage) {
+            const buffer = device.createBuffer({
+                size: array.byteLength,
+                usage,
+                mappedAtCreation: true
+            });
+            new Float32Array(buffer.getMappedRange()).set(array);
+            buffer.unmap();
+            return buffer;
+        }
+
+        // ---------- MatMul + Bias pipeline ----------
+        async function createMatMulPipeline(device, M, N, K) {
+            const code = `
+            struct Buf { data: array<f32>, };
+            @group(0) @binding(0) var<storage, read> A: Buf;
+            @group(0) @binding(1) var<storage, read> W: Buf;
+            @group(0) @binding(2) var<storage, read> B: Buf;
+            @group(0) @binding(3) var<storage, read_write> Out: Buf;
+
+            @compute @workgroup_size(8,8)
+            fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+                let m = gid.x;
+                let n = gid.y;
+                if (m >= ${M}u || n >= ${N}u) { return; }
+                var sum: f32 = 0.0;
+                for (var k: u32 = 0u; k < ${K}u; k = k + 1u) {
+                    // PyTorch Linear stores weight as [out_features, in_features]
+                    // y[n] = sum_k x[k] * W[n, k]
+                    sum += A.data[m * ${K}u + k] * W.data[n * ${K}u + k];
+                }
+                Out.data[m * ${N}u + n] = sum + B.data[n];
+            }
+            `;
+            const module = device.createShaderModule({ code });
+            return device.createComputePipeline({ layout: "auto", compute: { module, entryPoint: "main" } });
+        }
+        //                     sum += A.data[m * ${K}u + k] * W.data[n * ${K}u + k];
+        //                     sum += A[m * ${K}u + k] * W[k * ${N}u + n];
+
+        // ---------- Execute MatMul + Bias ----------
+        async function matMul(device, pipeline, A_buf, W_buf, B_buf, M, N) {
+            const outSize = M * N * 4;
+            const Out_buf = device.createBuffer({ size: outSize, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+            const bindGroup = device.createBindGroup({
+                layout: pipeline.getBindGroupLayout(0),
+                entries: [
+                    { binding: 0, resource: { buffer: A_buf } },
+                    { binding: 1, resource: { buffer: W_buf } },
+                    { binding: 2, resource: { buffer: B_buf } },
+                    { binding: 3, resource: { buffer: Out_buf } }
+                ]
+            });
+            const encoder = device.createCommandEncoder();
+            const pass = encoder.beginComputePass();
+            pass.setPipeline(pipeline);
+            pass.setBindGroup(0, bindGroup);
+            const workX = Math.ceil(M / 8);
+            const workY = Math.ceil(N / 8);
+            pass.dispatchWorkgroups(workX, workY);
+            pass.end();
+            device.queue.submit([encoder.finish()]);
+
+            // Read back
+            const readBuffer = device.createBuffer({
+                size: outSize,
+                usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
+            });
+            const copyEncoder = device.createCommandEncoder();
+            console.log(Out_buf, "------", readBuffer, "------", outSize, "the first");
+            copyEncoder.copyBufferToBuffer(Out_buf, 0, readBuffer, 0, outSize);
+            device.queue.submit([copyEncoder.finish()]);
+            await readBuffer.mapAsync(GPUMapMode.READ);
+            const array = new Float32Array(readBuffer.getMappedRange().slice(0));
+            readBuffer.unmap();
+            return array;
+        }
+
+        // ---------- ReLU ----------
+        async function relu(device, X_buf, length) {
+            const code = `
+            @group(0) @binding(0) var<storage, read_write> X: array<f32>;
+            @compute @workgroup_size(64)
+            fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+                let i = gid.x;
+                if (i >= ${length}u) { return; }
+                if (X[i] < 0.0) { X[i] = 0.0; }
+            }
+            `;
+            const module = device.createShaderModule({ code });
+            const pipeline = device.createComputePipeline({ layout: "auto", compute: { module, entryPoint: "main" } });
+            const bindGroup = device.createBindGroup({
+                layout: pipeline.getBindGroupLayout(0),
+                entries: [{ binding: 0, resource: { buffer: X_buf } }]
+            });
+            const encoder = device.createCommandEncoder();
+            const pass = encoder.beginComputePass();
+            pass.setPipeline(pipeline);
+            pass.setBindGroup(0, bindGroup);
+            const work = Math.ceil(length / 64);
+            pass.dispatchWorkgroups(work);
+            pass.end();
+            device.queue.submit([encoder.finish()]);
+        }
+
+        // ---------- Run dynamic network ----------
+        async function runNetwork(inputArray) {
+            const device = await initWebGPU();
+            const network = await loadNetwork();
+
+            // Input buffer
+            let x_buf = createBuffer(device, new Float32Array(inputArray), GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST);
+            let currentLength = inputArray.length;
+
+            for (const layer of network) {
+                if (layer.type === "linear") {
+                    const W = await loadNpy(`web_model/${layer.weight}`);
+                    const B = await loadNpy(`web_model/${layer.bias}`);
+                    const W_buf = createBuffer(device, W, GPUBufferUsage.STORAGE);
+                    const B_buf = createBuffer(device, B, GPUBufferUsage.STORAGE);
+                    const pipeline = await createMatMulPipeline(device, 1, layer.out_features, layer.in_features);
+                    const out = await matMul(device, pipeline, x_buf, W_buf, B_buf, 1, layer.out_features);
+                    x_buf = createBuffer(device, out, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST);
+                    currentLength = layer.out_features;
+                } else if (layer.type === "relu") {
+                    // ReLU operates in-place
+                    await relu(device, x_buf, currentLength);
+                }
+            }
+
+            // Read final output with correct size
+            const finalBytes = currentLength * 4;
+            const readBuffer = device.createBuffer({
+                size: finalBytes,
+                usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
+            });
+            const copyEncoder = device.createCommandEncoder();
+            console.log(x_buf, "------", readBuffer, "------", finalBytes, "the final");
+            copyEncoder.copyBufferToBuffer(x_buf, 0, readBuffer, 0, finalBytes);
+            device.queue.submit([copyEncoder.finish()]);
+            await readBuffer.mapAsync(GPUMapMode.READ);
+            const array = new Float32Array(readBuffer.getMappedRange().slice(0));
+            readBuffer.unmap();
+            console.log("Final output:", array);
+            alert("Final output: " + array.join(", "));
+        }
+
+        document.getElementById("runBtn").addEventListener("click", () => {
+            const input = [112, 212, 134, 4, 43, 3126, 7, 8321, 1, 10]; // test example
+            runNetwork(input);
+        });
+
+    </script>
+</head>
+
+<body>
+    <button id="runBtn">Run Dynamic Network</button>
+</body>
+
+</html>
